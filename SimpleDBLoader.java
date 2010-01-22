@@ -15,6 +15,9 @@ import java.util.concurrent.Future;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 
+// Needed to prevent warnings on a call to the clone method on a generic ArrayList
+@SuppressWarnings("unchecked")
+
 public class SimpleDBLoader {
 
     /************************************************************************
@@ -25,9 +28,15 @@ public class SimpleDBLoader {
     public String accessKeyId = "";
     public String secretAccessKey = "";
 
-    int domainCount = 100;
+    int domainCount = 25;
     String domainPrefix = "test_domain";
     int batchCount = 20;
+
+    ArrayList<ArrayList<ReplaceableItem>> domainItems = new ArrayList<ArrayList<ReplaceableItem>>(domainCount);
+    List<Future<BatchPutAttributesResponse>> putResponses = new ArrayList<Future<BatchPutAttributesResponse>>();
+
+    long jobStartTime = 0;
+    ArrayList<Long> domainLastPutTime = new ArrayList<Long>(domainCount);
 
     public static void main(String[] args) {
 
@@ -159,7 +168,88 @@ public class SimpleDBLoader {
     
     public int getDomainForId(int id)
     {
-        return (id%domainCount);
+        return (Math.abs(id)%domainCount);
+    }
+    
+    // See http://www.concentric.net/~Ttwang/tech/inthash.htm for the source of this hash function
+    public int hashFunction(int input)
+    {
+        int key = ~input + (input << 15); // key = (key << 15) - key - 1;
+        key = key ^ (key >>> 12);
+        key = key + (key << 2);
+        key = key ^ (key >>> 4);
+        key = key * 2057; // key = (key + (key << 3)) + (key << 11);
+        key = key ^ (key >>> 16);
+        return key;
+    }
+
+    // Returns the current required delay between calls to the same domain, based on the idea that
+    // AWS penalizes 'bursty' writers by throttling them, so we need to slowly ease up our request
+    // rate from 1 per second at the start, to around 5 over the course of two minutes
+    public long getDesiredDelay(int domainIndex)
+    {
+        long currentTime = (System.currentTimeMillis()-jobStartTime);
+        
+        // Ramp up over 120 seconds
+        float maxTime = (120*1000);
+        
+        // Start with one request per second
+        float startValue = 1.0f;
+        
+        // And finish with five requests per second
+        float endValue = 5.0f;
+        
+        float currentRPS;
+        if (currentTime>maxTime)
+            currentRPS = endValue;
+        else
+            currentRPS = startValue + ((currentTime/maxTime)*(endValue-startValue));
+            
+        long desiredDelay = (long)(1000/currentRPS);
+        
+        return desiredDelay;
+    }
+    
+    // This function implements the throttling behavior we need to avoid being marked as 'bursty'
+    public void throttlePut(int domainIndex)
+    {        
+        long currentTime = (System.currentTimeMillis()-jobStartTime);
+           
+        long timeSinceLastPut = domainLastPutTime.get(domainIndex);
+        
+        long currentDelay = (currentTime-timeSinceLastPut);
+        
+        long desiredDelay = getDesiredDelay(domainIndex);
+        
+        if (currentDelay<desiredDelay)
+        {
+            try {
+                Thread.sleep(desiredDelay-currentDelay);
+            } catch (Exception e) {
+                // do nothing
+            }
+            currentTime = (System.currentTimeMillis()-jobStartTime);
+        }
+        
+        domainLastPutTime.set(domainIndex, currentTime);
+    }
+
+    public void startBatch(int domainIndex, AmazonSimpleDBAsync service)
+    {
+        throttlePut(domainIndex);
+    
+        String domainName = getDomainNameForIndex(domainIndex);
+        ArrayList<ReplaceableItem> batchItems = 
+            (ArrayList<ReplaceableItem>)(domainItems.get(domainIndex).clone());
+        
+        BatchPutAttributesRequest request =  new BatchPutAttributesRequest(domainName, batchItems);
+
+        List<BatchPutAttributesRequest> requests = new ArrayList<BatchPutAttributesRequest>();
+        requests.add(request);
+
+        startBatchPutAttributes(service, requests);
+
+        domainItems.set(domainIndex, new ArrayList<ReplaceableItem>());    
     }
 
     public void runTests(int itemCount, int threadCount) 
@@ -167,23 +257,27 @@ public class SimpleDBLoader {
         AmazonSimpleDBConfig config = new AmazonSimpleDBConfig().withMaxConnections (threadCount);
         ExecutorService executor = Executors.newFixedThreadPool(threadCount);
         AmazonSimpleDBAsync service = new AmazonSimpleDBAsyncClient(accessKeyId, secretAccessKey, config, executor);
-
-        ArrayList<ArrayList<ReplaceableItem>> domainItems = 
-            new ArrayList<ArrayList<ReplaceableItem>>(domainCount);
     
         System.out.println("Loading items...");
         long startTime = System.currentTimeMillis();        
+
+        jobStartTime = startTime;
+        domainLastPutTime.clear();
 
         // Create empty batch buffers for each domain
         for (int domainIndex=0; domainIndex<domainCount; domainIndex+=1)
         {
             domainItems.add(new ArrayList<ReplaceableItem>());
+            domainLastPutTime.add(new Long(0));
         }
 
         // Create the requested number of items and add them to SimpleDB in batches
         for (int index=0; index<itemCount; index+=1)
         {
-            int id = (index*277);
+            // Try to generate a fairly random id for each index, so that we don't end up
+            // filling each bucket at the same time and send them off at staggered intervals.
+            // This is closer to the real-world distribution of ids, and makes a better test.
+            int id = hashFunction(index);
             int domainIndex = getDomainForId(id);
 
             ArrayList<ReplaceableAttribute> attributes = new ArrayList<ReplaceableAttribute>();
@@ -198,15 +292,7 @@ public class SimpleDBLoader {
             domainItems.get(domainIndex).add(item);
             if (domainItems.get(domainIndex).size()>batchCount)
             {
-                String domainName = getDomainNameForIndex(domainIndex);
-                BatchPutAttributesRequest request = 
-                    new BatchPutAttributesRequest(domainName, domainItems.get(domainIndex));
-
-                List<BatchPutAttributesRequest> requests = new ArrayList<BatchPutAttributesRequest>();
-                requests.add(request);
-
-                invokeBatchPutAttributes(service, requests);
-                domainItems.get(domainIndex).clear();
+                startBatch(domainIndex, service);
             }
         }
 
@@ -215,17 +301,11 @@ public class SimpleDBLoader {
         {
             if (domainItems.get(domainIndex).size()>0)
             {
-                String domainName = getDomainNameForIndex(domainIndex);
-                BatchPutAttributesRequest request = 
-                    new BatchPutAttributesRequest(domainName, domainItems.get(domainIndex));
-
-                List<BatchPutAttributesRequest> requests = new ArrayList<BatchPutAttributesRequest>();
-                requests.add(request);
-
-                invokeBatchPutAttributes(service, requests);
-                domainItems.get(domainIndex).clear();
+                startBatch(domainIndex, service);
             }
         }
+        
+        waitForFinishBatchPutAttributes();
 
         executor.shutdown();
 
@@ -235,41 +315,25 @@ public class SimpleDBLoader {
         float itemsPerSecond = (itemCount/elapsedSeconds);
         System.out.println("Took "+elapsedSeconds+" seconds for "+itemCount+" items ("+itemsPerSecond+" items per second)");
     }
-                                            
-    /**
-     * Batch Put Attributes request sample
-     * The BatchPutAttributes operation creates or replaces attributes within one or more items.
-     * You specify the item name with the Item.X.ItemName parameter.
-     * You specify new attributes using a combination of the Item.X.Attribute.Y.Name and Item.X.Attribute.Y.Value parameters.
-     * You specify the first attribute for the first item by the parameters Item.0.Attribute.0.Name and Item.0.Attribute.0.Value,
-     * the second attribute for the first item by the parameters Item.0.Attribute.1.Name and Item.0.Attribute.1.Value, and so on.
-     * Attributes are uniquely identified within an item by their name/value combination. For example, a single
-     * item can have the attributes { "first_name", "first_value" } and { "first_name",
-     * second_value" }. However, it cannot have two attribute instances where both the Item.X.Attribute.Y.Name and
-     * Item.X.Attribute.Y.Value are the same.
-     * Optionally, the requestor can supply the Replace parameter for each individual value. Setting this value
-     * to true will cause the new attribute value to replace the existing attribute value(s). For example, if an
-     * item 'I' has the attributes { 'a', '1' }, { 'b', '2'} and { 'b', '3' } and the requestor does a
-     * BacthPutAttributes of {'I', 'b', '4' } with the Replace parameter set to true, the final attributes of the
-     * item will be { 'a', '1' } and { 'b', '4' }, replacing the previous values of the 'b' attribute
-     * with the new value.
-     *   
-     * @param service instance of AmazonSimpleDB service
-     * @param requests list of requests to process
-     */
-    public static void invokeBatchPutAttributes(AmazonSimpleDBAsync service, List<BatchPutAttributesRequest> requests) {
-        List<Future<BatchPutAttributesResponse>> responses = new ArrayList<Future<BatchPutAttributesResponse>>();
+
+    // This function adds the request into the queue
+    public void startBatchPutAttributes(AmazonSimpleDBAsync service, List<BatchPutAttributesRequest> requests) {
         for (BatchPutAttributesRequest request : requests) {
-            responses.add(service.batchPutAttributesAsync(request));
+            
+            putResponses.add(service.batchPutAttributesAsync(request));
         }
-        for (Future<BatchPutAttributesResponse> future : responses) {
+    }
+    
+    // After all the requests have been added to the queue, wait for them to complete
+    public void waitForFinishBatchPutAttributes() {
+        for (Future<BatchPutAttributesResponse> future : putResponses) {
             while (!future.isDone()) {
                 Thread.yield();
             }
             try {
                 BatchPutAttributesResponse response = future.get();
                 // Original request corresponding to this response, if needed:
-                BatchPutAttributesRequest originalRequest = requests.get(responses.indexOf(future));
+                //BatchPutAttributesRequest originalRequest = putRequests.get(responses.indexOf(future));
                 // System.out.println("Response request id: " + response.getResponseMetadata().getRequestId());
             } catch (Exception e) {
                 if (e.getCause() instanceof AmazonSimpleDBException) {
