@@ -15,9 +15,84 @@ import java.util.concurrent.Future;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 
+class ItemToAdd {
+    public ReplaceableItem item;
+    public int domainIndex;
+    
+    public ItemToAdd(ReplaceableItem inItem, int inDomainIndex) {
+        item = inItem;
+        domainIndex = inDomainIndex;
+    }
+}
+
+// These are the two functions that any data source needs to implement to plug into the SimpleDB loader
+interface ItemGenerator {
+    boolean hasMoreItems();
+    ItemToAdd getNextItem();
+}
+
+// This data source creates a set number of quasi-random objects, and is used to test the loader
+class TestItemGenerator implements ItemGenerator {
+
+    int index;
+    int itemCount;
+    int domainCount;
+    
+    public TestItemGenerator(int inItemCount, int inDomainCount) {
+        index = 0;
+        itemCount = inItemCount;
+        domainCount = inDomainCount;
+    }
+    
+    public boolean hasMoreItems()
+    {
+        return (index<itemCount);
+    }
+    
+    // See http://www.concentric.net/~Ttwang/tech/inthash.htm for the source of this hash function
+    public int hashFunction(int input)
+    {
+        int key = ~input + (input << 15); // key = (key << 15) - key - 1;
+        key = key ^ (key >>> 12);
+        key = key + (key << 2);
+        key = key ^ (key >>> 4);
+        key = key * 2057; // key = (key + (key << 3)) + (key << 11);
+        key = key ^ (key >>> 16);
+        return key;
+    }
+
+    public int getDomainForId(int id)
+    {
+        return (Math.abs(id)%domainCount);
+    }
+
+    public ItemToAdd getNextItem()
+    {
+        // Try to generate a fairly random id for each index, so that we don't end up
+        // filling each bucket at the same time and send them off at staggered intervals.
+        // This is closer to the real-world distribution of ids, and makes a better test.
+        int id = hashFunction(index);
+        int domainIndex = getDomainForId(id);
+
+        ArrayList<ReplaceableAttribute> attributes = new ArrayList<ReplaceableAttribute>();
+
+        attributes.add(new ReplaceableAttribute("first", Integer.toString(id), false));
+        attributes.add(new ReplaceableAttribute("second", Integer.toString(id*2), false));
+        attributes.add(new ReplaceableAttribute("third", "{a:'foo', b:'bar'}", false));
+        attributes.add(new ReplaceableAttribute("fourth", "[10,9,8,7,6,5,4,3,2,1]", false));
+        
+        ReplaceableItem item = new ReplaceableItem(Integer.toString(id), attributes);
+        
+        ItemToAdd result = new ItemToAdd(item, domainIndex);
+        
+        index += 1;
+        
+        return result;
+    }
+}
+
 // Needed to prevent warnings on a call to the clone method on a generic ArrayList
 @SuppressWarnings("unchecked")
-
 public class SimpleDBLoader {
 
     /************************************************************************
@@ -128,9 +203,18 @@ public class SimpleDBLoader {
             return domainPrefix+index;
     }
     
+    public AmazonSimpleDBConfig getConfig(int threadCount)
+    {
+        AmazonSimpleDBConfig config = new AmazonSimpleDBConfig().withMaxConnections(threadCount);
+        config.setMaxErrorRetry(5);
+        
+        return config;
+    }
+    
     public void setup()
     {
-        AmazonSimpleDBConfig config = new AmazonSimpleDBConfig().withMaxConnections (100);
+        AmazonSimpleDBConfig config = getConfig(100);
+        
         ExecutorService executor = Executors.newFixedThreadPool(100);
         AmazonSimpleDBAsync service = new AmazonSimpleDBAsyncClient(accessKeyId, secretAccessKey, config, executor);
 
@@ -149,7 +233,8 @@ public class SimpleDBLoader {
     
     public void cleanup()
     {
-        AmazonSimpleDBConfig config = new AmazonSimpleDBConfig().withMaxConnections (100);
+        AmazonSimpleDBConfig config = getConfig(100);
+
         ExecutorService executor = Executors.newFixedThreadPool(100);
         AmazonSimpleDBAsync service = new AmazonSimpleDBAsyncClient(accessKeyId, secretAccessKey, config, executor);
 
@@ -166,26 +251,9 @@ public class SimpleDBLoader {
         executor.shutdown();    
     }
     
-    public int getDomainForId(int id)
-    {
-        return (Math.abs(id)%domainCount);
-    }
-    
-    // See http://www.concentric.net/~Ttwang/tech/inthash.htm for the source of this hash function
-    public int hashFunction(int input)
-    {
-        int key = ~input + (input << 15); // key = (key << 15) - key - 1;
-        key = key ^ (key >>> 12);
-        key = key + (key << 2);
-        key = key ^ (key >>> 4);
-        key = key * 2057; // key = (key + (key << 3)) + (key << 11);
-        key = key ^ (key >>> 16);
-        return key;
-    }
-
     // Returns the current required delay between calls to the same domain, based on the idea that
     // AWS penalizes 'bursty' writers by throttling them, so we need to slowly ease up our request
-    // rate from 1 per second at the start, to around 5 over the course of two minutes
+    // rate from 1 per second at the start, to around 4 over the course of two minutes
     public long getDesiredDelay(int domainIndex)
     {
         long currentTime = (System.currentTimeMillis()-jobStartTime);
@@ -196,8 +264,8 @@ public class SimpleDBLoader {
         // Start with one request per second
         float startValue = 1.0f;
         
-        // And finish with five requests per second
-        float endValue = 5.0f;
+        // And finish with four requests per second
+        float endValue = 3.0f;
         
         float currentRPS;
         if (currentTime>maxTime)
@@ -253,8 +321,15 @@ public class SimpleDBLoader {
     }
 
     public void runTests(int itemCount, int threadCount) 
-    {        
-        AmazonSimpleDBConfig config = new AmazonSimpleDBConfig().withMaxConnections (threadCount);
+    {
+        ItemGenerator generator = new TestItemGenerator(itemCount, domainCount);
+        
+        runLoading(generator, threadCount);
+    }
+    
+    public void runLoading(ItemGenerator generator, int threadCount)
+    {
+        AmazonSimpleDBConfig config = getConfig(threadCount);
         ExecutorService executor = Executors.newFixedThreadPool(threadCount);
         AmazonSimpleDBAsync service = new AmazonSimpleDBAsyncClient(accessKeyId, secretAccessKey, config, executor);
     
@@ -271,23 +346,15 @@ public class SimpleDBLoader {
             domainLastPutTime.add(new Long(0));
         }
 
+        int itemCount = 0;
         // Create the requested number of items and add them to SimpleDB in batches
-        for (int index=0; index<itemCount; index+=1)
+        while (generator.hasMoreItems())
         {
-            // Try to generate a fairly random id for each index, so that we don't end up
-            // filling each bucket at the same time and send them off at staggered intervals.
-            // This is closer to the real-world distribution of ids, and makes a better test.
-            int id = hashFunction(index);
-            int domainIndex = getDomainForId(id);
-
-            ArrayList<ReplaceableAttribute> attributes = new ArrayList<ReplaceableAttribute>();
- 
-            attributes.add(new ReplaceableAttribute("first", Integer.toString(id), false));
-            attributes.add(new ReplaceableAttribute("second", Integer.toString(id*2), false));
-            attributes.add(new ReplaceableAttribute("third", "{a:'foo', b:'bar'}", false));
-            attributes.add(new ReplaceableAttribute("fourth", "[10,9,8,7,6,5,4,3,2,1]", false));
+            ItemToAdd itemToAdd = generator.getNextItem();
+            ReplaceableItem item = itemToAdd.item;
+            int domainIndex = itemToAdd.domainIndex;
             
-            ReplaceableItem item = new ReplaceableItem(Integer.toString(id), attributes);
+            itemCount += 1;
             
             domainItems.get(domainIndex).add(item);
             if (domainItems.get(domainIndex).size()>batchCount)
