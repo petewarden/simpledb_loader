@@ -1,7 +1,11 @@
 
-This project explores the fastest way of loading large amounts of data into SimpleDB.
+This project explores the fastest way of loading large amounts of data into SimpleDB. You can either run a synthetic benchmark, or point it at a file of data you want to upload to SDB.
 
-You'll need to edit SimpleDBLoader.java to add your own AWS keys and recompile before you can do anything.
+It now comes with pre-compiled Java binaries and a shell-script wrapper, so you can use it without having to compile it all yourself. To get started, cd into this directory and run
+./sdbloader help
+to see a mini-tutorial and manual.
+
+To compile this yourself:
 
 # First, cd into this directory in the terminal
 # Then run this line to compile the class:
@@ -9,16 +13,6 @@ javac -cp lib/amazon-simple-db-2009-04-15-java-library.jar SimpleDBLoader.java
 
 # You should then be able to run the loader class like this:
 java -cp lib/amazon-simple-db-2009-04-15-java-library.jar:lib/commons-httpclient-3.0.1.jar:lib/commons-logging-1.1.jar:lib/commons-codec-1.3.jar:. SimpleDBLoader help
-
-Once you've done that, create the domains you'll need by running this script as:
-java -cp<...> SimpleDBLoader setup
-
-After that, you can test the data loading speed by passing 'test' as the first argument, followed by an optional number of items (defaults to 10000)
-and the number of threads to use (defaults to 100), eg:
-java -cp<...> SimpleDBLoader test 10000 100
-
-When you're finished testing, run this command to remove the test domains:
-java -cp<...> SimpleDBLoader cleanup
 
 By Pete Warden <pete@petewarden.com> - see http://petewarden.typepad.com/ for more details.
 
