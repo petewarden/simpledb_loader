@@ -19,11 +19,13 @@ import java.util.concurrent.ExecutorService;
 import java.io.FileInputStream;
 import java.io.InputStreamReader;
 import java.io.BufferedReader;
+import java.io.FileReader;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.zip.*;
 import org.json.simple.parser.JSONParser;
 import org.json.simple.*;
+import au.com.bytecode.opencsv.CSVReader;
 
 class ItemToAdd {
     public ReplaceableItem item;
@@ -228,6 +230,149 @@ class JSONFileItemGenerator implements ItemGenerator {
     }
 }
 
+// Loads data from a CSV file, consisting of an initial line of comma-separated
+// strings defining the names of each column, followed by lines of comma-separated
+// values for each item. If a column named 'id' is present, then it will be used
+// as the item's name, otherwise the first column will be used.
+class CSVFileItemGenerator implements ItemGenerator {
+
+    CSVReader reader;
+    int domainCount;
+    String[] columnNames = null;
+    int idIndex = 0;
+    String[] nextLine = null;
+    int lineNumber = 0;
+    
+    public CSVFileItemGenerator(String filename, int inDomainCount, String idName) 
+    {
+        try 
+        {
+            FileReader fileReader = new FileReader(filename);
+            reader = new CSVReader(fileReader);
+        }
+        catch (FileNotFoundException exception)
+        {
+            System.err.println("File could not be read: "+filename);
+            System.exit(1);
+        }
+
+        try
+        {
+            columnNames = reader.readNext();
+        
+            idIndex = 0;
+            for (int index=0; index<columnNames.length; index+=1)
+            {
+                String currentName = columnNames[index];
+                if (currentName.toLowerCase().equals(idName))
+                {
+                    idIndex = index;
+                }
+            }
+            
+            nextLine = reader.readNext();
+            lineNumber += 1;
+        }
+        catch (Exception e)
+        {
+            System.err.println("Couldn't read headers from first line of CSV file: "+filename);
+            System.exit(1);
+        }
+
+        domainCount = inDomainCount;
+    }
+    
+    public boolean hasMoreItems()
+    {
+        return (nextLine!=null);
+    }
+    
+    public int hashFunction(String key)
+    {
+        CRC32 crc = new CRC32();
+        crc.update(key.getBytes());
+        return (int)(crc.getValue());
+    }
+    
+    public int getDomainForKey(String key)
+    {
+        int hash = hashFunction(key);
+        return (Math.abs(hash)%domainCount);
+    }
+    
+    public ItemToAdd getNextItem()
+    {
+        String key = "";
+        int domainIndex = 0;
+        ArrayList<ReplaceableAttribute> attributes = new ArrayList<ReplaceableAttribute>();
+
+        for (int column=0; column<nextLine.length; column+=1)
+        {
+            String value = nextLine[column];
+            if (column==idIndex)
+            {
+                key = value;
+                domainIndex = getDomainForKey(key);
+            }
+            else 
+            {
+                if (column>=columnNames.length)
+                {
+                    System.err.println("Too many values on line "+Integer.toString(lineNumber));
+                    System.exit(1);
+                }
+                
+                String baseName = columnNames[column];
+
+                final int maxLength = 1020;
+                if (value.length()<maxLength)
+                {
+                    attributes.add(new ReplaceableAttribute(baseName, value, false));
+                }
+                else 
+                {
+                    int index = 0;
+                    while (value.length()>0)
+                    {
+                        String subValue = value.substring(0, Math.min(maxLength, value.length()));
+                        String name;
+                        if (index==0)
+                            name = baseName;
+                        else
+                            name = baseName+"*"+Integer.toString(index);
+                        
+                        attributes.add(new ReplaceableAttribute(name, subValue, false));
+                
+                        value = value.substring(Math.min(maxLength, value.length()));
+                        index += 1;
+                    }
+                    
+                }            
+                
+            }
+
+        }
+    
+        ReplaceableItem item = new ReplaceableItem(key, attributes);
+        
+        ItemToAdd result = new ItemToAdd(item, domainIndex);
+
+        try
+        {
+            nextLine = reader.readNext();
+            lineNumber += 1;
+        }
+        catch (Exception e)
+        {
+            System.err.println("Exception on line "+Integer.toString(lineNumber));
+            System.err.println(e.getMessage());
+            System.exit(1);
+        }
+        
+        return result;    
+    }
+}
+
 // Needed to prevent warnings on a call to the clone method on a generic ArrayList
 @SuppressWarnings("unchecked")
 public class SimpleDBLoader {
@@ -248,6 +393,7 @@ public class SimpleDBLoader {
     float minRPS = 1.0f;
     float maxRPS = 3.0f;
     long rampTime = (120*1000);
+    String idName = "id";
 
     int itemCount = 10000;
     String filename = "";
@@ -302,6 +448,16 @@ public class SimpleDBLoader {
                 System.exit(1);
             }
             loader.loadJSONFile();
+        }
+        else if (command.equals("loadcsv"))
+        {
+            if (loader.filename.equals(""))
+            {
+                System.out.println("You must supply a filename to load the data from.");
+                loader.printHelp();
+                System.exit(1);
+            }
+            loader.loadCSVFile();
         }
         else 
         {
@@ -402,6 +558,10 @@ public class SimpleDBLoader {
             {
                 secretAccessKey = argValue;
             }            
+            else if (argName.equals("idname")||argName.equals("e"))
+            {
+                idName = argValue;
+            }            
             else
             {
                 System.out.println("Unexpected argument: "+currentToken);
@@ -431,7 +591,15 @@ public class SimpleDBLoader {
         System.out.println("The JSON format for uploading is to have each item's data on a separate line in the file. The first string is the unique ID to use");
         System.out.println("as the item's key, followed by a tab, then a JSON string containing an associative array describing that item's attributes and values.");
         System.out.println("");
+        System.out.println("To load from a comma-separated value (CSV) file pass in 'loadcsv' as the first argument,");
+        System.out.println("followed by -filename/-f <filename>, and the file's data will be uploaded.");
+        System.out.println("The CSV format for uploading is to have an initial line containing a list of the attributes names that each column represents,");
+        System.out.println("followed by lines containing the attribute values of each item. Since SimpleDB items require a unique ID, you either need to");
+        System.out.println("pass in the name of the column through -idname, or the first column will be picked by default.");
+        System.out.println("");
         System.out.println("You can supply the following arguments to configure the loading:");
+        System.out.println("-accesskey/-a : Your AWS account access key (required)");
+        System.out.println("-secretkey/-s : Your AWS secret key (required)");
         System.out.println("-domaincount/-d : How many domains to shard the items across (defaults to 25)");
         System.out.println("-domainprefix/-p : The string to start all the domain names with, followed by a number for each (defaults to 'test_domain')");
         System.out.println("-threadcount/-t : The number of threads to run in parallel (defaults to 100)");
@@ -441,8 +609,7 @@ public class SimpleDBLoader {
         System.out.println("-minrps/-n : To avoid throttling, we need to slowly ramp up our request speed. This is the number of requests per-domain, per-second to start with (defaults to 1.0)");
         System.out.println("-maxrps/-m : The maximum number of requests per-domain, per-second to ramp up to with (defaults to 3.0)");
         System.out.println("-ramptime/-r : How long to ramp up to the maximum rate, in seconds (defaults to 120)");
-        System.out.println("-accesskey/-a : Your AWS account access key, required");
-        System.out.println("-secretkey/-s : Your AWS secret key, required");
+        System.out.println("-idname/-e : For CSV loading, the name of the column to use as the item's unique name (defaults to 'id', or the first column if none matching the name is found)");
         System.out.println("");
         
         System.out.println("By Pete Warden <pete@petewarden.com> - see http://petewarden.typepad.com/ for more details");
@@ -583,6 +750,13 @@ public class SimpleDBLoader {
     public void loadJSONFile()
     {
         ItemGenerator generator = new JSONFileItemGenerator(filename, domainCount);
+        
+        runLoading(generator);
+    }
+
+    public void loadCSVFile()
+    {
+        ItemGenerator generator = new CSVFileItemGenerator(filename, domainCount, idName);
         
         runLoading(generator);
     }
