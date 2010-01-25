@@ -318,8 +318,8 @@ class CSVFileItemGenerator implements ItemGenerator {
             {
                 if (column>=columnNames.length)
                 {
-                    System.err.println("Too many values on line "+Integer.toString(lineNumber));
-                    System.exit(1);
+                    // Ignore any trailing values, rather than raising an error
+                    break;
                 }
                 
                 String baseName = columnNames[column];
